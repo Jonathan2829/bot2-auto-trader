@@ -3,5 +3,5 @@ pandas
 numpy
 requests
 openpyxl
-python-telegram-bot==13.15
+python-telegram-bot==20.7
 python-dotenv
