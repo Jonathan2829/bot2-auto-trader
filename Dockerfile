@@ -6,17 +6,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Certificados (HTTPS) y utilidades mínimas
+# Dependencias del sistema (necesarias para pandas/numpy)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    gcc \
+    build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# Instala dependencias primero (mejor cache)
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia el resto del proyecto
-COPY . /app
+COPY . .
 
-# Ejecuta BOT2
 CMD ["python", "-u", "bot2_auto_trader.py"]
+
