@@ -1,0 +1,23 @@
+app = "bot2-auto-trader"
+primary_region = "mia"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+# BOT2 es un worker (no expone puertos)
+[processes]
+  app = "python -u bot2_auto_trader.py"
+
+[restart]
+  policy = "always"
+
+# Opcional: si quieres limitar recursos
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+
