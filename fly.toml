@@ -1,0 +1,19 @@
+app = "bot-crypto-alertas"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  worker = "python bot_multi_pro_telegram.py"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "botdata"
+  destination = "/data"
+
+

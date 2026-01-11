@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# SQLite
+*.sqlite3
+
+# Estados / data local
+my_positions.json
+positions_state.json
+runtime_state.json
+
+# Archivos basura
+cd
+*.txt
