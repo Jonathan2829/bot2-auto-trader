@@ -1,5 +1,5 @@
 app = "bot2-auto-trader"
-primary_region = "mia"
+primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
@@ -14,5 +14,6 @@ primary_region = "mia"
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
+
 
 
