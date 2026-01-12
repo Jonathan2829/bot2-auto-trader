@@ -14,15 +14,15 @@ import hashlib
 import sqlite3
 import threading
 import traceback
-import asyncio
 from dataclasses import dataclass
-from typing import Dict, Optional, List
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import requests
-import numpy as np
 import pandas as pd
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================
 # ENV / CONFIG
@@ -40,38 +40,31 @@ BOT_PIN = os.getenv("BOT_PIN", "").strip()
 
 BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com").strip().rstrip("/")
 
-# --- AUTO (más agresivo que BOT1) ---
-AUTO_INTERVAL = os.getenv("AUTO_INTERVAL", "15m").strip()
-AUTO_LIMIT = int(os.getenv("AUTO_LIMIT", "120"))
+# =========================
+# PARÁMETROS AUTO
+# =========================
+POLL_SLEEP_SEC = float(os.getenv("POLL_SLEEP_SEC", "10"))
 
-AUTO_SCORE_MIN = int(os.getenv("AUTO_SCORE_MIN", "52"))         # más bajo = más trades
-AUTO_RSI_MIN = float(os.getenv("AUTO_RSI_MIN", "28"))           # más agresivo
-AUTO_RSI_MAX = float(os.getenv("AUTO_RSI_MAX", "78"))
-AUTO_ATR_PCT_MIN = float(os.getenv("AUTO_ATR_PCT_MIN", "0.12")) # más permisivo
-AUTO_VOL_MULT_MIN = float(os.getenv("AUTO_VOL_MULT_MIN", "1.15"))
-AUTO_MIN_QUOTE_VOL_5M = float(os.getenv("AUTO_MIN_QUOTE_VOL_5M", "120000"))  # liquidez mínima
+# Guardia de “no entrar tarde” vs señal BOT1
+PRICE_GUARD_PCT = float(os.getenv("PRICE_GUARD_PCT", "0.60"))  # 0.60%
 
-# Trading rules
-MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "25"))
-SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", str(12 * 60)))  # 12 min
-PRICE_GUARD_PCT = float(os.getenv("PRICE_GUARD_PCT", "0.60"))     # más permisivo que 0.4%
+# Gestión riesgo simple
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
+MIN_USDT_PER_TRADE = float(os.getenv("MIN_USDT_PER_TRADE", "10"))
 
-SOFT_TARGET_PCT = float(os.getenv("SOFT_TARGET_PCT", "2.0"))     # desde +2% baja riesgo
-HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "-2.0"))        # -2% se apaga
-
-POLL_SLEEP_SEC = float(os.getenv("POLL_SLEEP_SEC", "2"))
+# “Protección diaria” (placeholders; si luego implementas ventas, ahí sí cobran sentido)
+HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.0"))       # -2%
+SOFT_TARGET_PCT = float(os.getenv("SOFT_TARGET_PCT", "2.0"))   # +2% reduce riesgo
 
 # =========================
-# RUNTIME STATE
+# STATE
 # =========================
 state_lock = threading.Lock()
-APP_LOOP: Optional[asyncio.AbstractEventLoop] = None
-
-STATE: Dict = {
+STATE = {
     "armed": False,
     "armed_until": 0,
-    "capital": 0.0,
-    "slots": 0,
+    "capital": float(os.getenv("CAPITAL_USDT", "300")),  # capital lógico usado por el bot
+    "slots": int(os.getenv("SLOTS", "3")),
     "used_capital": 0.0,
     "trades_today": 0,
     "pnl_today": 0.0,       # % (solo real cuando tengas ventas; por ahora informativo)
@@ -105,31 +98,22 @@ def db_init():
     )""")
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS daily_stats(
+    CREATE TABLE IF NOT EXISTS daily_state(
       day TEXT PRIMARY KEY,
-      pnl REAL,
-      trades INTEGER
+      trades_today INTEGER,
+      pnl_today REAL,
+      used_capital REAL
     )""")
 
-    # (si BOT1 ya lo creó, no pasa nada)
+    # señales que “produce” BOT1 (si ya tienes esa tabla en BOT1, perfecto)
+    # Campos mínimos que este BOT2 usa: id, symbol, signal_price, status, ts
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signals_active(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      side TEXT NOT NULL,
+      symbol TEXT,
       signal_price REAL,
-      confidence TEXT,
-      score INTEGER,
-      rsi REAL,
-      atr_pct REAL,
-      quote_vol_5m REAL,
-      vol_mult REAL,
-      active_mode TEXT,
-      ladder TEXT,
-      sl_pct REAL,
-      note TEXT,
-      status TEXT NOT NULL DEFAULT 'NEW',
-      ts INTEGER NOT NULL,
+      status TEXT DEFAULT 'NEW',
+      ts INTEGER,
       exec_ts INTEGER,
       last_error TEXT
     )""")
@@ -137,192 +121,273 @@ def db_init():
     c.commit()
     c.close()
 
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def load_daily_state():
+    day = _today_key()
+    with state_lock:
+        STATE["day"] = day
+    c = db()
+    row = c.execute("SELECT day, trades_today, pnl_today, used_capital FROM daily_state WHERE day=?", (day,)).fetchone()
+    if row:
+        with state_lock:
+            STATE["trades_today"] = int(row["trades_today"] or 0)
+            STATE["pnl_today"] = float(row["pnl_today"] or 0.0)
+            STATE["used_capital"] = float(row["used_capital"] or 0.0)
+    else:
+        c.execute("INSERT OR REPLACE INTO daily_state(day, trades_today, pnl_today, used_capital) VALUES(?,?,?,?)",
+                  (day, 0, 0.0, 0.0))
+        c.commit()
+    c.close()
+
+def save_daily_state():
+    with state_lock:
+        day = STATE["day"] or _today_key()
+        t = STATE["trades_today"]
+        pnl = STATE["pnl_today"]
+        used = STATE["used_capital"]
+    c = db()
+    c.execute("INSERT OR REPLACE INTO daily_state(day, trades_today, pnl_today, used_capital) VALUES(?,?,?,?)",
+              (day, t, pnl, used))
+    c.commit()
+    c.close()
+
 # =========================
-# BINANCE
+# TELEGRAM HELPERS
 # =========================
+def _authorized(update: Update) -> bool:
+    if not AUTHORIZED_TELEGRAM_USER_ID:
+        return True
+    try:
+        uid = str(update.effective_user.id)
+        return uid == str(AUTHORIZED_TELEGRAM_USER_ID).strip()
+    except Exception:
+        return False
+
+async def send_async(ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    if TELEGRAM_CHAT_ID:
+        await ctx.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+
+def send_from_thread(app: Application, text: str):
+    # Enviar desde thread al chat AUTO
+    try:
+        if TELEGRAM_CHAT_ID:
+            app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception:
+        pass
+
+# =========================
+# BINANCE (ROBUSTO: firma + errores + MARKET por quote/qty)
+# =========================
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
+
 _session = requests.Session()
 if BINANCE_API_KEY:
     _session.headers.update({"X-MBX-APIKEY": BINANCE_API_KEY})
 
-def _sign(params: dict) -> dict:
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
+_exchange_cache = {}
+
+def _build_query(params: dict) -> str:
+    return urlencode(params, doseq=True)
+
+def _sign_query(query: str) -> str:
+    return hmac.new(
+        BINANCE_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def _raise_binance(r: requests.Response) -> dict:
+    """
+    NO uses r.raise_for_status(): te tapa el code/msg real de Binance.
+    """
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if not r.ok:
+        code = data.get("code")
+        msg = data.get("msg")
+        raise RuntimeError(f"Binance HTTP {r.status_code} | code={code} | msg={msg}")
+    return data
 
 def binance_get(path: str, params: dict = None) -> dict:
     r = _session.get(BINANCE_BASE + path, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    return _raise_binance(r)
 
-def binance_post(path: str, params: dict) -> dict:
+def binance_post_signed(path: str, params: dict) -> dict:
+    """
+    POST signed: manda params en CUERPO (data) y firma exactamente ese query-string.
+    """
+    params = dict(params)
     params["timestamp"] = int(time.time() * 1000)
-    params = _sign(params)
-    r = _session.post(BINANCE_BASE + path, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    params.setdefault("recvWindow", 5000)
+
+    query = _build_query(params)
+    sig = _sign_query(query)
+
+    r = _session.post(
+        BINANCE_BASE + path,
+        data=query + "&signature=" + sig,
+        timeout=15
+    )
+    return _raise_binance(r)
 
 def get_price(symbol: str) -> float:
     data = binance_get("/api/v3/ticker/price", {"symbol": symbol})
     return float(data["price"])
 
+def _get_symbol_rules(symbol: str) -> dict:
+    if symbol in _exchange_cache:
+        return _exchange_cache[symbol]
+    info = binance_get("/api/v3/exchangeInfo", {"symbol": symbol})
+    s = info["symbols"][0]
+
+    lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
+    step = Decimal(lot["stepSize"])
+    min_qty = Decimal(lot["minQty"])
+
+    notional = next((f for f in s["filters"] if f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL")), None)
+    min_notional = Decimal(notional.get("minNotional", "0")) if notional else Decimal("0")
+
+    rules = {
+        "quoteOrderQtyMarketAllowed": bool(s.get("quoteOrderQtyMarketAllowed", True)),
+        "stepSize": step,
+        "minQty": min_qty,
+        "minNotional": min_notional,
+    }
+    _exchange_cache[symbol] = rules
+    return rules
+
+def _round_step(qty: Decimal, step: Decimal) -> Decimal:
+    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+def market_buy_usdt(symbol: str, usdt: float):
+    """
+    Compra MARKET con USDT.
+    - Si el símbolo permite quoteOrderQtyMarketAllowed=True: usa quoteOrderQty
+    - Si no: calcula quantity con precio actual y redondea al stepSize
+    Retorna: (order_json, price_now, qty_estimada)
+    """
+    rules = _get_symbol_rules(symbol)
+    price_now = get_price(symbol)
+
+    usdt_d = Decimal(str(usdt))
+    if rules["quoteOrderQtyMarketAllowed"]:
+        order = binance_post_signed("/api/v3/order", {
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quoteOrderQty": str(usdt_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        })
+        return order, price_now, 0.0
+
+    qty = usdt_d / Decimal(str(price_now))
+    qty = _round_step(qty, rules["stepSize"])
+
+    if qty < rules["minQty"]:
+        raise RuntimeError(f"{symbol}: qty {qty} < minQty {rules['minQty']}")
+
+    order = binance_post_signed("/api/v3/order", {
+        "symbol": symbol,
+        "side": "BUY",
+        "type": "MARKET",
+        "quantity": format(qty, "f"),
+    })
+    return order, price_now, float(qty)
+
+# =========================
+# TA / ENTRIES (simple)
+# =========================
 def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     data = binance_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume","close_time",
-        "quote_vol","trades","taker_base","taker_quote","ignore"
-    ])
-    for col in ("open","high","low","close","volume","quote_vol"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna()
+    rows = []
+    for k in data:
+        rows.append({
+            "open_time": int(k[0]),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        })
+    df = pd.DataFrame(rows)
+    return df
 
-# =========================
-# AUTO SIGNAL (agresivo)
-# =========================
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / (avg_loss + 1e-12)
+    return 100 - (100 / (1 + rs))
+
 @dataclass
-class AutoSig:
+class AutoEntry:
     symbol: str
-    price: float
-    ema20: float
-    ema50: float
-    rsi: float
-    atr_pct: float
-    vol_mult: float
-    quote_vol_5m: float
-    score: int
-    ok: bool
     note: str
-
-def rsi_series(close: pd.Series, length: int = 14) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = (-delta).clip(lower=0)
-    ma_up = up.ewm(alpha=1/length, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/length, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-def atr_series(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/length, adjust=False).mean()
-    return atr.bfill()
-
-def quote_vol_approx_5m(df: pd.DataFrame, interval: str) -> float:
-    q = float(df["quote_vol"].iloc[-1])
-    if interval.endswith("m"):
-        mins = int(interval[:-1])
-        return q * (5.0 / mins) if mins > 0 else q
-    return q
-
-def vol_mult(df: pd.DataFrame, lookback: int = 20) -> float:
-    if len(df) < lookback + 2:
-        return 1.0
-    v_now = float(df["volume"].iloc[-1])
-    v_avg = float(df["volume"].iloc[-(lookback+1):-1].mean())
-    return 1.0 if v_avg <= 0 else (v_now / v_avg)
-
-def auto_compute(symbol: str) -> AutoSig:
-    df = fetch_klines(symbol, AUTO_INTERVAL, AUTO_LIMIT)
-    close = df["close"]
-
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    rsi = rsi_series(close, 14)
-    atr = atr_series(df, 14)
-
-    price = float(close.iloc[-1])
-    e20 = float(ema20.iloc[-1])
-    e50 = float(ema50.iloc[-1])
-    r = float(rsi.iloc[-1])
-    atr_pct = float((atr.iloc[-1] / price) * 100) if price > 0 else 0.0
-
-    vm = vol_mult(df, 20)
-    q5 = quote_vol_approx_5m(df, AUTO_INTERVAL)
-
-    # Score agresivo (más fácil entrar)
-    score = 0
-    score += 18 if e20 >= e50 else 10                 # no castiga tanto bajista
-    score += int(max(0, 25 - abs(r - 50) * 0.65))
-    score += int(min(22, atr_pct * 30))
-    score += int(min(20, max(0, (vm - 1.0) * 35)))
-    score += 10 if q5 >= AUTO_MIN_QUOTE_VOL_5M else 0
-    score = int(max(0, min(100, score)))
-
-    ok_rsi = (AUTO_RSI_MIN <= r <= AUTO_RSI_MAX)
-    ok_atr = (atr_pct >= AUTO_ATR_PCT_MIN)
-    ok_vol = (vm >= AUTO_VOL_MULT_MIN and q5 >= AUTO_MIN_QUOTE_VOL_5M)
-    ok_score = (score >= AUTO_SCORE_MIN)
-
-    ok = ok_rsi and ok_atr and ok_vol and ok_score
-    note = f"auto ok={ok} | score={score} rsi={r:.1f} atr%={atr_pct:.3f} vm={vm:.2f} q5={q5:.0f}"
-
-    return AutoSig(symbol, price, e20, e50, r, atr_pct, vm, q5, score, ok, note)
+    score: float
+    price: float
 
 def load_coins() -> List[str]:
-    with open(COINS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        coins = data
-    elif isinstance(data, dict) and isinstance(data.get("coins"), list):
-        coins = data["coins"]
-    else:
-        raise ValueError("coins.json inválido")
-    out = []
-    for c in coins:
-        s = str(c).upper().strip().replace("/", "")
-        if s:
-            out.append(s)
-    return out
-
-# =========================
-# TELEGRAM SECURITY
-# =========================
-def _authorized(update: Update) -> bool:
-    if not (AUTHORIZED_TELEGRAM_USER_ID and TELEGRAM_CHAT_ID):
-        return False
     try:
-        uid_ok = int(update.effective_user.id) == int(AUTHORIZED_TELEGRAM_USER_ID)
-        chat_ok = int(update.effective_chat.id) == int(TELEGRAM_CHAT_ID)
-        return uid_ok and chat_ok
-    except Exception:
-        return False
-
-def send_from_thread(app, text: str) -> None:
-    global APP_LOOP
-    if APP_LOOP is None:
-        return
-    fut = asyncio.run_coroutine_threadsafe(
-        app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text),
-        APP_LOOP
-    )
-    try:
-        fut.result(timeout=10)
+        with open(COINS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "coins" in data:
+            return [str(x).strip().upper() for x in data["coins"] if str(x).strip()]
+        if isinstance(data, list):
+            return [str(x).strip().upper() for x in data if str(x).strip()]
     except Exception:
         pass
+    return []
 
-async def send_async(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    await ctx.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+def compute_auto_entry(symbol: str) -> Optional[AutoEntry]:
+    """
+    Lógica agresiva simple:
+    - toma 15m (150 velas)
+    - busca pullback: close < EMA20 pero EMA20 > EMA50 (tendencia suave alcista)
+    - RSI entre 35-55 para “rebote”
+    """
+    try:
+        df = fetch_klines(symbol, "15m", 150)
+        c = df["close"]
+        e20 = ema(c, 20)
+        e50 = ema(c, 50)
+        r = rsi(c, 14)
+
+        close = float(c.iloc[-1])
+        ema20 = float(e20.iloc[-1])
+        ema50 = float(e50.iloc[-1])
+        rsi14 = float(r.iloc[-1])
+
+        trend_ok = ema20 > ema50
+        pullback_ok = close < ema20
+        rsi_ok = (35 <= rsi14 <= 55)
+
+        score = 0.0
+        note_parts = []
+        if trend_ok:
+            score += 1.0; note_parts.append("EMA20>EMA50")
+        if pullback_ok:
+            score += 1.0; note_parts.append("pullback <EMA20")
+        if rsi_ok:
+            score += 1.0; note_parts.append(f"RSI={rsi14:.1f}")
+
+        if score >= 2.0:
+            return AutoEntry(symbol=symbol, note=" | ".join(note_parts), score=score, price=close)
+        return None
+    except Exception:
+        return None
 
 # =========================
-# COMMANDS
+# TELEGRAM COMMANDS
 # =========================
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        return
-    await send_async(ctx,
-        "🧠 BOT2 AUTO (agresivo)\n"
-        "/status\n"
-        "/start_auto <capital> <slots> <minutos> <PIN>\n"
-        "/stop_auto <PIN>\n"
-        "/help\n\n"
-        "Ej: /start_auto 40 2 180 1234"
-    )
-
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -330,68 +395,35 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         armed = STATE["armed"]
         until = STATE["armed_until"]
         cap = STATE["capital"]
-        slots = STATE["slots"]
         used = STATE["used_capital"]
-        trades = STATE["trades_today"]
+        slots = STATE["slots"]
+        t = STATE["trades_today"]
         pnl = STATE["pnl_today"]
-        day = STATE["day"]
-    left = max(0, int(until - time.time())) if armed else 0
-    await send_async(ctx,
+    txt = (
         "📊 STATUS | BOT2 AUTO\n"
-        f"ARMED: {armed} | Tiempo restante: {left}s\n"
-        f"Capital: {cap:.2f} | Slots: {slots} | Usado: {used:.2f}\n"
-        f"Trades hoy: {trades}/{MAX_TRADES_DAY} | PnL hoy: {pnl:.2f}% | Día: {day}\n"
-        f"AUTO: score>={AUTO_SCORE_MIN} rsi={AUTO_RSI_MIN}-{AUTO_RSI_MAX} atr>={AUTO_ATR_PCT_MIN}%\n"
-        f"vol>={AUTO_VOL_MULT_MIN} q5>={AUTO_MIN_QUOTE_VOL_5M:.0f} | TTL={SIGNAL_TTL_SEC}s | Guard={PRICE_GUARD_PCT:.2f}%\n"
-        f"HardStop: {HARD_STOP_PCT:.2f}% | SoftTarget: +{SOFT_TARGET_PCT:.2f}%"
+        f"🧠 ARMADO: {armed} (hasta {until})\n"
+        f"💰 Capital: {cap:.2f} | Usado: {used:.2f} | Slots: {slots}\n"
+        f"🔁 Trades hoy: {t}/{MAX_TRADES_PER_DAY} | PnL hoy: {pnl:.2f}%\n"
+        f"🛡 Protección: {HARD_STOP_PCT}% | Reduce riesgo desde +{SOFT_TARGET_PCT}%"
     )
+    await send_async(ctx, txt)
 
-async def cmd_start_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_arm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    if len(ctx.args) < 4:
-        await send_async(ctx, "Uso: /start_auto <capital> <slots> <minutos> <PIN>")
+    if len(ctx.args) < 2:
+        await send_async(ctx, "Uso: /arm <MINUTOS> <PIN>")
         return
-    try:
-        capital = float(ctx.args[0]); slots = int(ctx.args[1]); minutes = int(ctx.args[2]); pin = str(ctx.args[3]).strip()
-    except Exception:
-        await send_async(ctx, "❌ Formato inválido. Ej: /start_auto 40 2 180 1234")
-        return
+    minutes = int(str(ctx.args[0]).strip())
+    pin = str(ctx.args[1]).strip()
     if pin != BOT_PIN:
         await send_async(ctx, "❌ PIN incorrecto")
         return
-    if capital < 10:
-        await send_async(ctx, "❌ Capital muy bajo (mínimo 10 USDT).")
-        return
-    if slots < 1 or slots > 10:
-        await send_async(ctx, "❌ Slots inválidos (1-10).")
-        return
-    if minutes < 1 or minutes > 24*60:
-        await send_async(ctx, "❌ Minutos inválidos (1-1440).")
-        return
-
+    until = int(time.time()) + minutes * 60
     with state_lock:
         STATE["armed"] = True
-        STATE["armed_until"] = int(time.time()) + minutes * 60
-        STATE["capital"] = capital
-        STATE["slots"] = slots
-        STATE["used_capital"] = 0.0
-        STATE["trades_today"] = 0
-        STATE["pnl_today"] = 0.0
-        STATE["active_symbols"].clear()
-        STATE["exec_lock"] = False
-        STATE["day"] = time.strftime("%Y-%m-%d")
-
-    await send_async(ctx,
-        "🧠 AUTO TRADING ACTIVADO\n"
-        f"Capital: {capital:.2f} USDT\n"
-        f"Slots: {slots}\n"
-        f"Tiempo: {minutes} min\n"
-        f"Perfil AUTO (agresivo): score>={AUTO_SCORE_MIN} | RSI {AUTO_RSI_MIN}-{AUTO_RSI_MAX}\n"
-        f"ATR>={AUTO_ATR_PCT_MIN}% | VolMult>={AUTO_VOL_MULT_MIN} | Q5>={AUTO_MIN_QUOTE_VOL_5M:.0f}\n"
-        f"TTL: {SIGNAL_TTL_SEC}s | Price guard: {PRICE_GUARD_PCT:.2f}%\n"
-        f"Protección: {HARD_STOP_PCT}% | Reduce riesgo desde +{SOFT_TARGET_PCT}%"
-    )
+        STATE["armed_until"] = until
+    await send_async(ctx, f"✅ AUTO ARMADO por {minutes} min (hasta {until})")
 
 async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
@@ -406,99 +438,81 @@ async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STATE["armed"] = False
         STATE["armed_until"] = 0
         STATE["exec_lock"] = False
-        STATE["active_symbols"].clear()
-    await send_async(ctx, "🛑 AUTO TRADING DESACTIVADO")
+    await send_async(ctx, "🛑 AUTO detenido")
 
 # =========================
-# EXECUTE BUY
+# CORE BUY
 # =========================
 def execute_buy(app, symbol: str, usdt: float, signal_price: float, tag: str):
+    # Guardia para no entrar tarde si la señal ya se movió demasiado
     price_now = get_price(symbol)
-
     if signal_price and signal_price > 0:
         diff = abs(price_now - signal_price) / signal_price * 100
         if diff > PRICE_GUARD_PCT:
             raise RuntimeError(f"Late entry (guard {diff:.2f}%)")
 
-    order = binance_post("/api/v3/order", {
-        "symbol": symbol,
-        "side": "BUY",
-        "type": "MARKET",
-        "quoteOrderQty": round(usdt, 2)
-    })
+    order, price_exec, _qty_est = market_buy_usdt(symbol, usdt)
 
-    send_from_thread(app,
+    send_from_thread(
+        app,
         "🚀 ORDEN EJECUTADA\n"
         f"{symbol}\n"
         f"USDT: {usdt:.2f}\n"
-        f"Precio: {price_now:.8f}\n"
+        f"Precio: {price_exec:.8f}\n"
         f"Fuente: {tag}"
     )
-    return order, price_now
+    return order, price_exec
 
 # =========================
 # CORE LOOP (THREAD)
 # =========================
-def process_loop(app):
-    coins = []
-    try:
-        coins = load_coins()
-    except Exception:
-        pass
-
-    last_auto_scan = 0
+def process_loop(app: Application):
+    coins = load_coins()
+    send_from_thread(app, f"✅ BOT2 AUTO loop ON | coins={len(coins)} | check={POLL_SLEEP_SEC}s")
 
     while True:
         try:
-            now = int(time.time())
-            day = time.strftime("%Y-%m-%d")
-
+            # reset diario
+            today = _today_key()
             with state_lock:
-                if STATE["day"] != day:
-                    STATE["day"] = day
+                if STATE["day"] != today:
+                    STATE["day"] = today
                     STATE["trades_today"] = 0
                     STATE["pnl_today"] = 0.0
+                    STATE["used_capital"] = 0.0
+                    STATE["active_symbols"] = set()
+                    save_daily_state()
 
-                if not STATE["armed"] or now > STATE["armed_until"]:
+            with state_lock:
+                armed = STATE["armed"]
+                until = STATE["armed_until"]
+                trades_today = STATE["trades_today"]
+                used_capital = STATE["used_capital"]
+                cap = STATE["capital"]
+
+            if armed and int(time.time()) > int(until):
+                with state_lock:
                     STATE["armed"] = False
-                    time.sleep(5)
-                    continue
+                    STATE["armed_until"] = 0
+                armed = False
 
-                if STATE["pnl_today"] <= HARD_STOP_PCT:
-                    STATE["armed"] = False
-                    send_from_thread(app, f"🧯 PROTECCIÓN DIARIA ACTIVADA ({STATE['pnl_today']:.2f}%)")
-                    time.sleep(5)
-                    continue
+            if (not armed) or trades_today >= MAX_TRADES_PER_DAY:
+                time.sleep(POLL_SLEEP_SEC)
+                continue
 
-                if STATE["trades_today"] >= MAX_TRADES_DAY:
-                    time.sleep(5)
-                    continue
-
-                if STATE["exec_lock"]:
-                    time.sleep(1)
-                    continue
-
-            # ========== 1) Consumir señales BOT1 (signals_active NEW) ==========
-            conn = db()
-            rows = conn.execute("""
-              SELECT * FROM signals_active
-              WHERE status='NEW'
-              ORDER BY ts ASC
-              LIMIT 5
-            """).fetchall()
-            conn.close()
-
+            # 1) Consumir señales NEW de BOT1
             did_trade = False
+            c = db()
+            sigs = c.execute(
+                "SELECT id, symbol, signal_price, ts, status FROM signals_active "
+                "WHERE status='NEW' ORDER BY ts ASC LIMIT 3"
+            ).fetchall()
+            c.close()
 
-            for sig in rows:
-                age = now - int(sig["ts"])
-                if age > SIGNAL_TTL_SEC:
-                    c = db()
-                    c.execute("UPDATE signals_active SET status='EXPIRED' WHERE id=?", (sig["id"],))
-                    c.commit(); c.close()
+            for sig in sigs:
+                symbol = str(sig["symbol"]).upper().strip()
+                if not symbol:
                     continue
-
-                symbol = sig["symbol"]
 
                 with state_lock:
                     if symbol in STATE["active_symbols"]:
@@ -516,140 +530,127 @@ def process_loop(app):
                         usdt_avail = max(0.0, STATE["capital"] - STATE["used_capital"])
                         usdt = min(base, usdt_avail)
 
-                    if usdt < 10:
-                        raise RuntimeError("Capital insuficiente (min 10 USDT)")
+                    if usdt < MIN_USDT_PER_TRADE:
+                        raise RuntimeError(f"Capital insuficiente (min {MIN_USDT_PER_TRADE} USDT)")
 
                     execute_buy(app, symbol, usdt, float(sig["signal_price"] or 0), "BOT1")
 
-                    c = db()
-                    c.execute("UPDATE signals_active SET status='EXECUTED', exec_ts=? WHERE id=?", (int(time.time()), sig["id"]))
-                    c.commit(); c.close()
+                    c2 = db()
+                    c2.execute(
+                        "UPDATE signals_active SET status='EXECUTED', exec_ts=? WHERE id=?",
+                        (int(time.time()), sig["id"])
+                    )
+                    c2.commit()
+                    c2.close()
 
                     with state_lock:
                         STATE["used_capital"] += usdt
                         STATE["trades_today"] += 1
+                    save_daily_state()
                     did_trade = True
 
                 except Exception as e:
-                    c = db()
-                    c.execute("UPDATE signals_active SET status='REJECTED', last_error=? WHERE id=?", (str(e), sig["id"]))
-                    c.commit(); c.close()
-                    send_from_thread(app, f"❌ RECHAZADA {symbol}: {e}")
+                    # guardar error real
+                    try:
+                        c2 = db()
+                        c2.execute(
+                            "UPDATE signals_active SET status='REJECTED', last_error=? WHERE id=?",
+                            (str(e), sig["id"])
+                        )
+                        c2.commit()
+                        c2.close()
+                    except Exception:
+                        pass
+                    send_from_thread(app, f"❌ AUTO rechazado {symbol}: {e}")
 
                 finally:
                     with state_lock:
                         STATE["exec_lock"] = False
                         STATE["active_symbols"].discard(symbol)
 
-            # ========== 2) AUTO SCAN (agresivo) si no hubo trade y cada ~10s ==========
-            if not did_trade and coins and (time.time() - last_auto_scan) > 10:
-                last_auto_scan = time.time()
+            if did_trade:
+                time.sleep(POLL_SLEEP_SEC)
+                continue
 
-                # escaneo rápido (máx 5 monedas por vuelta para no saturar)
-                sample = coins[:]
-                # rotación simple
-                sample = sample[(now % max(1, len(sample))):] + sample[:(now % max(1, len(sample)))]
-
-                checked = 0
-                for symbol in sample:
-                    if checked >= 5:
+            # 2) Si no hubo señales, buscar auto-entries (agresivo)
+            #    (limitado a 1 trade por vuelta)
+            for symbol in coins[:]:
+                with state_lock:
+                    trades_today = STATE["trades_today"]
+                    if trades_today >= MAX_TRADES_PER_DAY:
                         break
-                    checked += 1
+                    if symbol in STATE["active_symbols"]:
+                        continue
+                    if STATE["slots"] > 0 and len(STATE["active_symbols"]) >= STATE["slots"]:
+                        continue
+                    STATE["active_symbols"].add(symbol)
+
+                try:
+                    a = compute_auto_entry(symbol)
+                    if not a:
+                        continue
 
                     with state_lock:
-                        if symbol in STATE["active_symbols"]:
-                            continue
-                        if STATE["slots"] > 0 and len(STATE["active_symbols"]) >= STATE["slots"]:
-                            break
-                        if STATE["exec_lock"]:
-                            break
-                        STATE["exec_lock"] = True
-                        STATE["active_symbols"].add(symbol)
+                        base = STATE["capital"] / max(1, STATE["slots"])
+                        if STATE["pnl_today"] >= SOFT_TARGET_PCT:
+                            base *= 0.5
+                        usdt_avail = max(0.0, STATE["capital"] - STATE["used_capital"])
+                        usdt = min(base, usdt_avail)
 
-                    try:
-                        a = auto_compute(symbol)
-                        if not a.ok:
-                            continue
+                    if usdt < MIN_USDT_PER_TRADE:
+                        continue
 
-                        with state_lock:
-                            base = STATE["capital"] / max(1, STATE["slots"])
-                            if STATE["pnl_today"] >= SOFT_TARGET_PCT:
-                                base *= 0.5
-                            usdt_avail = max(0.0, STATE["capital"] - STATE["used_capital"])
-                            usdt = min(base, usdt_avail)
+                    execute_buy(app, symbol, usdt, 0.0, "AUTO")
 
-                        if usdt < 10:
-                            raise RuntimeError("Capital insuficiente (min 10 USDT)")
+                    with state_lock:
+                        STATE["used_capital"] += usdt
+                        STATE["trades_today"] += 1
+                    save_daily_state()
 
-                        execute_buy(app, symbol, usdt, a.price, "AUTO")
-                        with state_lock:
-                            STATE["used_capital"] += usdt
-                            STATE["trades_today"] += 1
+                    send_from_thread(app, f"🧠 AUTO-ENTRY OK: {symbol}\n{a.note}")
+                    break
 
-                        # guarda log mínimo
-                        c = db()
-                        c.execute(
-                            "INSERT INTO trade_log(symbol,side,usdt,price,qty,pnl,ts) VALUES(?,?,?,?,?,?,?)",
-                            (symbol, "BUY", float(usdt), float(a.price), 0.0, 0.0, int(time.time()))
-                        )
-                        c.commit(); c.close()
+                except Exception as e:
+                    send_from_thread(app, f"❌ AUTO rechazado {symbol}: {e}")
 
-                        send_from_thread(app, f"🧠 AUTO-ENTRY OK: {symbol}\n{a.note}")
-                        did_trade = True
-
-                    except Exception as e:
-                        send_from_thread(app, f"❌ AUTO rechazado {symbol}: {e}")
-
-                    finally:
-                        with state_lock:
-                            STATE["exec_lock"] = False
-                            STATE["active_symbols"].discard(symbol)
+                finally:
+                    with state_lock:
+                        STATE["active_symbols"].discard(symbol)
 
             time.sleep(POLL_SLEEP_SEC)
 
         except Exception:
-            traceback.print_exc()
+            send_from_thread(app, "⚠️ Loop error:\n" + traceback.format_exc())
             time.sleep(5)
 
 # =========================
 # MAIN
 # =========================
-async def post_init(app):
-    global APP_LOOP
-    APP_LOOP = asyncio.get_running_loop()
-    db_init()
-    t = threading.Thread(target=process_loop, args=(app,), daemon=True)
-    t.start()
-    try:
-        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 BOT2 AUTO listo. Usa /start_auto")
-    except Exception:
-        pass
-
 def main():
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and AUTHORIZED_TELEGRAM_USER_ID):
-        print("❌ Faltan variables TELEGRAM_*_AUTO o AUTHORIZED_TELEGRAM_USER_ID.")
+    db_init()
+    load_daily_state()
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Falta TELEGRAM_TOKEN_AUTO o TELEGRAM_CHAT_ID_AUTO")
         return
-    if not (BINANCE_API_KEY and BINANCE_API_SECRET):
-        print("❌ Faltan BINANCE_API_KEY / BINANCE_API_SECRET.")
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        print("❌ Falta BINANCE_API_KEY o BINANCE_API_SECRET")
         return
     if not BOT_PIN:
-        print("❌ BOT_PIN no configurado.")
+        print("❌ Falta BOT_PIN")
         return
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("start_auto", cmd_start_auto))
+    app.add_handler(CommandHandler("arm", cmd_arm))
     app.add_handler(CommandHandler("stop_auto", cmd_stop_auto))
 
-    print("✅ Bot2 AUTO (agresivo) iniciado. Polling ON.")
-    app.run_polling(drop_pending_updates=True)
+    t = threading.Thread(target=process_loop, args=(app,), daemon=True)
+    t.start()
+
+    print("✅ BOT2 AUTO iniciado.")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
