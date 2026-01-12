@@ -1,0 +1,7 @@
+python-binance
+pandas
+numpy
+requests
+openpyxl
+python-telegram-bot==20.7
+python-dotenv
