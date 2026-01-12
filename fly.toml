@@ -1,19 +1,26 @@
-app = "bot-crypto-alertas"
-primary_region = "ams"
+app = 'bot2-auto-trader-jrdro'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
-[processes]
-  worker = "python bot_multi_pro_telegram.py"
-
-[[vm]]
-  memory = "1gb"
-  cpu_kind = "shared"
-  cpus = 1
+[env]
+  PYTHONUNBUFFERED = '1'
+  MODE = 'AGRESIVO'
+  SIGNAL_SOURCE = 'telegram'
+  LOOP_SEC = '10'
+  PAPER_FEE = '0.001'
+  PAPER_SLIPPAGE_BPS = '2'
+  SQLITE_FILE = '/data/bot_state.sqlite3'
 
 [mounts]
-  source = "botdata"
-  destination = "/data"
+  source = 'bot2_data'
+  destination = '/data'
 
+[processes]
+  app = 'python -u bot2_auto_trader.py'
 
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
