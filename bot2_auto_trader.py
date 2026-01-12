@@ -1,162 +1,72 @@
 # bot2_auto_trader.py
-# BOT2 AUTO TRADER (agresivo e independiente de BOT1)
-# - PTB v20.7 async
-# - Compra por señales BOT1 (signals_active NEW)
-# - Y SI NO HAY señales, genera ENTRADAS propias (más agresivo) desde coins.json
-# - Mensajes solo a chat AUTO
+# BOT2 PAPER TRADER (agresivo si quieres) + atado a BOT1 por:
+#  - SIGNAL_SOURCE=sqlite   (lee signals_active de un sqlite compartido)
+#  - SIGNAL_SOURCE=telegram (BOT1 reenvía señal al chat de BOT2 como "SIG ...")
+#
+# Importante:
+# - NO manda órdenes reales. Solo PAPER (simulación con precio real ticker/price).
+# - Mantiene estados en SQLite (positions/kv_state/kv_runtime) usando tu db_sqlite.py
 
 import os
 import time
-import hmac
 import json
 import math
-import hashlib
-import sqlite3
-import threading
 import traceback
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
-import pandas as pd
+from decimal import Decimal
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+from db_sqlite import BotDB
+from mode_profiles import get_profile
 
 # =========================
-# ENV / CONFIG
+# ENV
 # =========================
-SQLITE_FILE = os.getenv("SQLITE_FILE", "bot_state.sqlite3")
-COINS_FILE = os.getenv("COINS_FILE", "coins.json")
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN_AUTO", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_AUTO", "").strip()
+TELEGRAM_TOKEN_AUTO = os.getenv("TELEGRAM_TOKEN_AUTO", "").strip()
+TELEGRAM_CHAT_ID_AUTO = os.getenv("TELEGRAM_CHAT_ID_AUTO", "").strip()
 AUTHORIZED_TELEGRAM_USER_ID = os.getenv("AUTHORIZED_TELEGRAM_USER_ID", "").strip()
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-BOT_PIN = os.getenv("BOT_PIN", "").strip()
+# BOT2 DB (posiciones paper del bot2)
+SQLITE_FILE = os.getenv("SQLITE_FILE", "bot_state.sqlite3")
 
-BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com").strip().rstrip("/")
+# Fuente de señales
+SIGNAL_SOURCE = os.getenv("SIGNAL_SOURCE", "telegram").strip().lower()  # telegram | sqlite
+# Si SIGNAL_SOURCE=sqlite, este es el sqlite donde BOT1 escribe signals_active
+SIGNALS_SQLITE_FILE = os.getenv("SIGNALS_SQLITE_FILE", SQLITE_FILE)
 
-# =========================
-# PARÁMETROS AUTO
-# =========================
-POLL_SLEEP_SEC = float(os.getenv("POLL_SLEEP_SEC", "10"))
+# Paper params
+PAPER_FEE = float(os.getenv("PAPER_FEE", "0.001"))               # 0.10%
+PAPER_SLIPPAGE_BPS = float(os.getenv("PAPER_SLIPPAGE_BPS", "2")) # 2 bps = 0.02%
+LOOP_SEC = int(os.getenv("LOOP_SEC", "10"))
 
-# Guardia de “no entrar tarde” vs señal BOT1
-PRICE_GUARD_PCT = float(os.getenv("PRICE_GUARD_PCT", "0.60"))  # 0.60%
+# Modo
+MODE = os.getenv("MODE", "AGRESIVO").upper().strip()
 
-# Gestión riesgo simple
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
-MIN_USDT_PER_TRADE = float(os.getenv("MIN_USDT_PER_TRADE", "10"))
-
-# “Protección diaria” (placeholders; si luego implementas ventas, ahí sí cobran sentido)
-HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.0"))       # -2%
-SOFT_TARGET_PCT = float(os.getenv("SOFT_TARGET_PCT", "2.0"))   # +2% reduce riesgo
+BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com").rstrip("/")
 
 # =========================
-# STATE
+# Helpers
 # =========================
-state_lock = threading.Lock()
-STATE = {
-    "armed": False,
-    "armed_until": 0,
-    "capital": float(os.getenv("CAPITAL_USDT", "300")),  # capital lógico usado por el bot
-    "slots": int(os.getenv("SLOTS", "3")),
-    "used_capital": 0.0,
-    "trades_today": 0,
-    "pnl_today": 0.0,       # % (solo real cuando tengas ventas; por ahora informativo)
-    "active_symbols": set(),
-    "exec_lock": False,
-    "day": None,
-}
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
-# =========================
-# DB
-# =========================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(SQLITE_FILE, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def db_init():
-    c = db()
-    cur = c.cursor()
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS trade_log(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT,
-      side TEXT,
-      usdt REAL,
-      price REAL,
-      qty REAL,
-      pnl REAL,
-      ts INTEGER
-    )""")
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS daily_state(
-      day TEXT PRIMARY KEY,
-      trades_today INTEGER,
-      pnl_today REAL,
-      used_capital REAL
-    )""")
-
-    # señales que “produce” BOT1 (si ya tienes esa tabla en BOT1, perfecto)
-    # Campos mínimos que este BOT2 usa: id, symbol, signal_price, status, ts
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS signals_active(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT,
-      signal_price REAL,
-      status TEXT DEFAULT 'NEW',
-      ts INTEGER,
-      exec_ts INTEGER,
-      last_error TEXT
-    )""")
-
-    c.commit()
-    c.close()
-
-def _today_key() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def load_daily_state():
-    day = _today_key()
-    with state_lock:
-        STATE["day"] = day
-    c = db()
-    row = c.execute("SELECT day, trades_today, pnl_today, used_capital FROM daily_state WHERE day=?", (day,)).fetchone()
-    if row:
-        with state_lock:
-            STATE["trades_today"] = int(row["trades_today"] or 0)
-            STATE["pnl_today"] = float(row["pnl_today"] or 0.0)
-            STATE["used_capital"] = float(row["used_capital"] or 0.0)
-    else:
-        c.execute("INSERT OR REPLACE INTO daily_state(day, trades_today, pnl_today, used_capital) VALUES(?,?,?,?)",
-                  (day, 0, 0.0, 0.0))
-        c.commit()
-    c.close()
-
-def save_daily_state():
-    with state_lock:
-        day = STATE["day"] or _today_key()
-        t = STATE["trades_today"]
-        pnl = STATE["pnl_today"]
-        used = STATE["used_capital"]
-    c = db()
-    c.execute("INSERT OR REPLACE INTO daily_state(day, trades_today, pnl_today, used_capital) VALUES(?,?,?,?)",
-              (day, t, pnl, used))
-    c.commit()
-    c.close()
-
-# =========================
-# TELEGRAM HELPERS
-# =========================
-def _authorized(update: Update) -> bool:
+def authorized(update: Update) -> bool:
     if not AUTHORIZED_TELEGRAM_USER_ID:
         return True
     try:
@@ -165,492 +75,511 @@ def _authorized(update: Update) -> bool:
     except Exception:
         return False
 
-async def send_async(ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    if TELEGRAM_CHAT_ID:
-        await ctx.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+def get_last_price(symbol: str) -> float:
+    r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/price", params={"symbol": symbol}, timeout=12)
+    r.raise_for_status()
+    return float(r.json()["price"])
 
-def send_from_thread(app: Application, text: str):
-    # Enviar desde thread al chat AUTO
-    try:
-        if TELEGRAM_CHAT_ID:
-            app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-    except Exception:
-        pass
+def apply_slippage(price: float, side: str) -> float:
+    slip = PAPER_SLIPPAGE_BPS / 10000.0
+    if side.upper() == "BUY":
+        return price * (1.0 + slip)
+    return price * (1.0 - slip)
 
-# =========================
-# BINANCE (ROBUSTO: firma + errores + MARKET por quote/qty)
-# =========================
-from decimal import Decimal, ROUND_DOWN
-from urllib.parse import urlencode
-
-_session = requests.Session()
-if BINANCE_API_KEY:
-    _session.headers.update({"X-MBX-APIKEY": BINANCE_API_KEY})
-
-_exchange_cache = {}
-
-def _build_query(params: dict) -> str:
-    return urlencode(params, doseq=True)
-
-def _sign_query(query: str) -> str:
-    return hmac.new(
-        BINANCE_API_SECRET.encode("utf-8"),
-        query.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-def _raise_binance(r: requests.Response) -> dict:
+def parse_sig_message(text: str) -> Optional[Dict[str, Any]]:
     """
-    NO uses r.raise_for_status(): te tapa el code/msg real de Binance.
+    Formato recomendado (simple y robusto):
+      SIG SYMBOL USD ENTRY LADDER SL
+    Ej:
+      SIG ADAUSDT 20 0.403 2:50,3.5:30,5:20 2.0
+
+    También acepta JSON:
+      {"type":"SIG","symbol":"ADAUSDT","usd":20,"entry":0.403,"ladder":"2:50,3.5:30,5:20","sl":2.0}
     """
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-    if not r.ok:
-        code = data.get("code")
-        msg = data.get("msg")
-        raise RuntimeError(f"Binance HTTP {r.status_code} | code={code} | msg={msg}")
-    return data
-
-def binance_get(path: str, params: dict = None) -> dict:
-    r = _session.get(BINANCE_BASE + path, params=params, timeout=15)
-    return _raise_binance(r)
-
-def binance_post_signed(path: str, params: dict) -> dict:
-    """
-    POST signed: manda params en CUERPO (data) y firma exactamente ese query-string.
-    """
-    params = dict(params)
-    params["timestamp"] = int(time.time() * 1000)
-    params.setdefault("recvWindow", 5000)
-
-    query = _build_query(params)
-    sig = _sign_query(query)
-
-    r = _session.post(
-        BINANCE_BASE + path,
-        data=query + "&signature=" + sig,
-        timeout=15
-    )
-    return _raise_binance(r)
-
-def get_price(symbol: str) -> float:
-    data = binance_get("/api/v3/ticker/price", {"symbol": symbol})
-    return float(data["price"])
-
-def _get_symbol_rules(symbol: str) -> dict:
-    if symbol in _exchange_cache:
-        return _exchange_cache[symbol]
-    info = binance_get("/api/v3/exchangeInfo", {"symbol": symbol})
-    s = info["symbols"][0]
-
-    lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
-    step = Decimal(lot["stepSize"])
-    min_qty = Decimal(lot["minQty"])
-
-    notional = next((f for f in s["filters"] if f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL")), None)
-    min_notional = Decimal(notional.get("minNotional", "0")) if notional else Decimal("0")
-
-    rules = {
-        "quoteOrderQtyMarketAllowed": bool(s.get("quoteOrderQtyMarketAllowed", True)),
-        "stepSize": step,
-        "minQty": min_qty,
-        "minNotional": min_notional,
-    }
-    _exchange_cache[symbol] = rules
-    return rules
-
-def _round_step(qty: Decimal, step: Decimal) -> Decimal:
-    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-
-def market_buy_usdt(symbol: str, usdt: float):
-    """
-    Compra MARKET con USDT.
-    - Si el símbolo permite quoteOrderQtyMarketAllowed=True: usa quoteOrderQty
-    - Si no: calcula quantity con precio actual y redondea al stepSize
-    Retorna: (order_json, price_now, qty_estimada)
-    """
-    rules = _get_symbol_rules(symbol)
-    price_now = get_price(symbol)
-
-    usdt_d = Decimal(str(usdt))
-    if rules["quoteOrderQtyMarketAllowed"]:
-        order = binance_post_signed("/api/v3/order", {
-            "symbol": symbol,
-            "side": "BUY",
-            "type": "MARKET",
-            "quoteOrderQty": str(usdt_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
-        })
-        return order, price_now, 0.0
-
-    qty = usdt_d / Decimal(str(price_now))
-    qty = _round_step(qty, rules["stepSize"])
-
-    if qty < rules["minQty"]:
-        raise RuntimeError(f"{symbol}: qty {qty} < minQty {rules['minQty']}")
-
-    order = binance_post_signed("/api/v3/order", {
-        "symbol": symbol,
-        "side": "BUY",
-        "type": "MARKET",
-        "quantity": format(qty, "f"),
-    })
-    return order, price_now, float(qty)
-
-# =========================
-# TA / ENTRIES (simple)
-# =========================
-def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = binance_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    rows = []
-    for k in data:
-        rows.append({
-            "open_time": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-        })
-    df = pd.DataFrame(rows)
-    return df
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-@dataclass
-class AutoEntry:
-    symbol: str
-    note: str
-    score: float
-    price: float
-
-def load_coins() -> List[str]:
-    try:
-        with open(COINS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "coins" in data:
-            return [str(x).strip().upper() for x in data["coins"] if str(x).strip()]
-        if isinstance(data, list):
-            return [str(x).strip().upper() for x in data if str(x).strip()]
-    except Exception:
-        pass
-    return []
-
-def compute_auto_entry(symbol: str) -> Optional[AutoEntry]:
-    """
-    Lógica agresiva simple:
-    - toma 15m (150 velas)
-    - busca pullback: close < EMA20 pero EMA20 > EMA50 (tendencia suave alcista)
-    - RSI entre 35-55 para “rebote”
-    """
-    try:
-        df = fetch_klines(symbol, "15m", 150)
-        c = df["close"]
-        e20 = ema(c, 20)
-        e50 = ema(c, 50)
-        r = rsi(c, 14)
-
-        close = float(c.iloc[-1])
-        ema20 = float(e20.iloc[-1])
-        ema50 = float(e50.iloc[-1])
-        rsi14 = float(r.iloc[-1])
-
-        trend_ok = ema20 > ema50
-        pullback_ok = close < ema20
-        rsi_ok = (35 <= rsi14 <= 55)
-
-        score = 0.0
-        note_parts = []
-        if trend_ok:
-            score += 1.0; note_parts.append("EMA20>EMA50")
-        if pullback_ok:
-            score += 1.0; note_parts.append("pullback <EMA20")
-        if rsi_ok:
-            score += 1.0; note_parts.append(f"RSI={rsi14:.1f}")
-
-        if score >= 2.0:
-            return AutoEntry(symbol=symbol, note=" | ".join(note_parts), score=score, price=close)
-        return None
-    except Exception:
+    t = (text or "").strip()
+    if not t:
         return None
 
-# =========================
-# TELEGRAM COMMANDS
-# =========================
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        return
-    with state_lock:
-        armed = STATE["armed"]
-        until = STATE["armed_until"]
-        cap = STATE["capital"]
-        used = STATE["used_capital"]
-        slots = STATE["slots"]
-        t = STATE["trades_today"]
-        pnl = STATE["pnl_today"]
-    txt = (
-        "📊 STATUS | BOT2 AUTO\n"
-        f"🧠 ARMADO: {armed} (hasta {until})\n"
-        f"💰 Capital: {cap:.2f} | Usado: {used:.2f} | Slots: {slots}\n"
-        f"🔁 Trades hoy: {t}/{MAX_TRADES_PER_DAY} | PnL hoy: {pnl:.2f}%\n"
-        f"🛡 Protección: {HARD_STOP_PCT}% | Reduce riesgo desde +{SOFT_TARGET_PCT}%"
-    )
-    await send_async(ctx, txt)
-
-async def cmd_arm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        return
-    if len(ctx.args) < 2:
-        await send_async(ctx, "Uso: /arm <MINUTOS> <PIN>")
-        return
-    minutes = int(str(ctx.args[0]).strip())
-    pin = str(ctx.args[1]).strip()
-    if pin != BOT_PIN:
-        await send_async(ctx, "❌ PIN incorrecto")
-        return
-    until = int(time.time()) + minutes * 60
-    with state_lock:
-        STATE["armed"] = True
-        STATE["armed_until"] = until
-    await send_async(ctx, f"✅ AUTO ARMADO por {minutes} min (hasta {until})")
-
-async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        return
-    if len(ctx.args) < 1:
-        await send_async(ctx, "Uso: /stop_auto <PIN>")
-        return
-    if str(ctx.args[0]).strip() != BOT_PIN:
-        await send_async(ctx, "❌ PIN incorrecto")
-        return
-    with state_lock:
-        STATE["armed"] = False
-        STATE["armed_until"] = 0
-        STATE["exec_lock"] = False
-    await send_async(ctx, "🛑 AUTO detenido")
-
-# =========================
-# CORE BUY
-# =========================
-def execute_buy(app, symbol: str, usdt: float, signal_price: float, tag: str):
-    # Guardia para no entrar tarde si la señal ya se movió demasiado
-    price_now = get_price(symbol)
-    if signal_price and signal_price > 0:
-        diff = abs(price_now - signal_price) / signal_price * 100
-        if diff > PRICE_GUARD_PCT:
-            raise RuntimeError(f"Late entry (guard {diff:.2f}%)")
-
-    order, price_exec, _qty_est = market_buy_usdt(symbol, usdt)
-
-    send_from_thread(
-        app,
-        "🚀 ORDEN EJECUTADA\n"
-        f"{symbol}\n"
-        f"USDT: {usdt:.2f}\n"
-        f"Precio: {price_exec:.8f}\n"
-        f"Fuente: {tag}"
-    )
-    return order, price_exec
-
-# =========================
-# CORE LOOP (THREAD)
-# =========================
-def process_loop(app: Application):
-    coins = load_coins()
-    send_from_thread(app, f"✅ BOT2 AUTO loop ON | coins={len(coins)} | check={POLL_SLEEP_SEC}s")
-
-    while True:
+    if t.startswith("{") and t.endswith("}"):
         try:
-            # reset diario
-            today = _today_key()
-            with state_lock:
-                if STATE["day"] != today:
-                    STATE["day"] = today
-                    STATE["trades_today"] = 0
-                    STATE["pnl_today"] = 0.0
-                    STATE["used_capital"] = 0.0
-                    STATE["active_symbols"] = set()
-                    save_daily_state()
+            obj = json.loads(t)
+            if str(obj.get("type", "")).upper() in ("SIG", "SIGNAL"):
+                return {
+                    "symbol": str(obj.get("symbol", "")).upper().strip(),
+                    "usd": safe_float(obj.get("usd", 0)),
+                    "entry": safe_float(obj.get("entry", 0)),
+                    "ladder": str(obj.get("ladder", "")).strip(),
+                    "sl": safe_float(obj.get("sl", 0)),
+                    "ts": now_ms(),
+                    "source": "telegram_json",
+                }
+        except Exception:
+            return None
 
-            with state_lock:
-                armed = STATE["armed"]
-                until = STATE["armed_until"]
-                trades_today = STATE["trades_today"]
-                used_capital = STATE["used_capital"]
-                cap = STATE["capital"]
+    parts = t.split()
+    if len(parts) >= 6 and parts[0].upper() == "SIG":
+        return {
+            "symbol": parts[1].upper().strip(),
+            "usd": safe_float(parts[2], 0),
+            "entry": safe_float(parts[3], 0),
+            "ladder": parts[4].strip(),
+            "sl": safe_float(parts[5], 0),
+            "ts": now_ms(),
+            "source": "telegram_text",
+        }
+    return None
 
-            if armed and int(time.time()) > int(until):
-                with state_lock:
-                    STATE["armed"] = False
-                    STATE["armed_until"] = 0
-                armed = False
+def ladder_to_hits(ladder: str) -> Dict[str, int]:
+    """
+    Guarda hits por nivel, ej {"2.0":0,"3.5":0,"5.0":0}
+    """
+    hits = {}
+    for part in (ladder or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            p, _w = part.split(":")
+            hits[str(float(p))] = 0
+        except Exception:
+            pass
+    return hits
 
-            if (not armed) or trades_today >= MAX_TRADES_PER_DAY:
-                time.sleep(POLL_SLEEP_SEC)
-                continue
+# =========================
+# Core paper execution
+# =========================
+@dataclass
+class PaperOrder:
+    ok: bool
+    side: str
+    symbol: str
+    qty: float
+    price: float
+    fee: float
+    err: str = ""
 
-            # 1) Consumir señales NEW de BOT1
-            did_trade = False
-            c = db()
-            sigs = c.execute(
-                "SELECT id, symbol, signal_price, ts, status FROM signals_active "
-                "WHERE status='NEW' ORDER BY ts ASC LIMIT 3"
-            ).fetchall()
-            c.close()
+def paper_buy(symbol: str, usd: float) -> PaperOrder:
+    try:
+        px = get_last_price(symbol)
+        fill = apply_slippage(px, "BUY")
+        qty = usd / fill if fill > 0 else 0.0
+        qty = math.floor(qty * 1e8) / 1e8
+        fee = usd * PAPER_FEE
+        if qty <= 0:
+            return PaperOrder(False, "BUY", symbol, 0.0, fill, fee, "qty<=0")
+        return PaperOrder(True, "BUY", symbol, qty, fill, fee, "")
+    except Exception as e:
+        return PaperOrder(False, "BUY", symbol, 0.0, 0.0, 0.0, str(e))
 
-            for sig in sigs:
-                symbol = str(sig["symbol"]).upper().strip()
-                if not symbol:
+def paper_sell(symbol: str, qty: float) -> PaperOrder:
+    try:
+        px = get_last_price(symbol)
+        fill = apply_slippage(px, "SELL")
+        gross = qty * fill
+        fee = gross * PAPER_FEE
+        if qty <= 0:
+            return PaperOrder(False, "SELL", symbol, 0.0, fill, fee, "qty<=0")
+        return PaperOrder(True, "SELL", symbol, qty, fill, fee, "")
+    except Exception as e:
+        return PaperOrder(False, "SELL", symbol, 0.0, 0.0, 0.0, str(e))
+
+def pct_gain(price: float, entry: float) -> float:
+    if entry <= 0:
+        return 0.0
+    return (price / entry - 1.0) * 100.0
+
+def parse_ladder(ladder: str) -> List[Tuple[float, float]]:
+    # "2:50,3.5:30,5:20" => [(2.0,0.50),(3.5,0.30),(5.0,0.20)]
+    out = []
+    for part in (ladder or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        p, w = part.split(":")
+        out.append((float(p), float(w) / 100.0))
+    s = sum(w for _, w in out)
+    if s <= 0:
+        return []
+    return [(p, w / s) for p, w in out]
+
+# =========================
+# BOT
+# =========================
+class Bot2Paper:
+    def __init__(self):
+        self.db = BotDB(SQLITE_FILE)
+        self.profile = get_profile(MODE)
+
+        # runtime
+        self.db.runtime_set("mode", MODE)
+        self.db.runtime_set("signal_source", SIGNAL_SOURCE)
+        self.last_action_ts = int(self.db.runtime_get("last_action_ts", 0) or 0)
+
+    def can_trade(self) -> Tuple[bool, str]:
+        return True, "OK"
+
+    def max_positions(self) -> int:
+        return int(self.profile.get("MAX_POS", self.profile.get("max_positions", 3)) or 3)
+
+    def per_trade_usd(self) -> float:
+        return float(self.profile.get("USD_PER_TRADE", self.profile.get("per_trade_usdt", 20)) or 20)
+
+    def sl_default(self) -> float:
+        return float(self.profile.get("SL_PCT", self.profile.get("sl_pct", 2.4)) or 2.4)
+
+    def ladder_default(self) -> str:
+        return str(self.profile.get("LADDER", self.profile.get("ladder", "2.5:45,4:35,5.5:20")))
+
+    def cooldown_sec(self) -> int:
+        return int(self.profile.get("COOLDOWN", self.profile.get("cooldown_sec", 60)) or 60)
+
+    def cooldown_ok(self) -> bool:
+        return (time.time() - (self.last_action_ts / 1000.0)) >= self.cooldown_sec()
+
+    def _touch_action(self):
+        self.last_action_ts = now_ms()
+        self.db.runtime_set("last_action_ts", self.last_action_ts)
+
+    def status_text(self) -> str:
+        pos = self.db.list_positions()
+        return (
+            f"📊 STATUS | BOT2 PAPER\n"
+            f"🧠 Modo: {MODE}\n"
+            f"🔗 Señales: {SIGNAL_SOURCE}\n"
+            f"📌 Posiciones: {len(pos)}/{self.max_positions()}\n"
+            f"⏱ Cooldown: {self.cooldown_sec()}s | Loop: {LOOP_SEC}s\n"
+            f"💸 Fee: {PAPER_FEE*100:.3f}% | Slippage: {PAPER_SLIPPAGE_BPS} bps\n"
+            f"🕒 {now_utc()}"
+        )
+
+    def paper_open_from_signal(self, sig: Dict[str, Any]) -> Tuple[bool, str]:
+        ok, reason = self.can_trade()
+        if not ok:
+            return False, reason
+
+        if not self.cooldown_ok():
+            return False, f"Cooldown activo ({self.cooldown_sec()}s)"
+
+        symbol = sig["symbol"]
+        usd = float(sig.get("usd") or 0) or self.per_trade_usd()
+        ladder = (sig.get("ladder") or "").strip() or self.ladder_default()
+        sl = float(sig.get("sl") or 0) or self.sl_default()
+        entry_hint = float(sig.get("entry") or 0)
+
+        positions = self.db.list_positions()
+        if len(positions) >= self.max_positions():
+            return False, f"Max posiciones alcanzado {len(positions)}/{self.max_positions()}"
+
+        if self.db.get_position(symbol):
+            return False, f"Ya existe posición en {symbol}"
+
+        buy = paper_buy(symbol, usd)
+        if not buy.ok:
+            return False, f"PAPER BUY falló: {buy.err}"
+
+        entry = buy.price
+        qty = buy.qty
+        buy_cost = usd
+
+        self.db.upsert_position(
+            symbol=symbol,
+            in_position=1,
+            usd=float(usd),
+            entry=float(entry),
+            qty=float(qty),
+            buy_cost=float(buy_cost),
+            fee_buy=float(buy.fee),
+            fee_sell=0.0,
+            sl_pct=float(sl),
+            ladder_json=json.dumps({"ladder": ladder}),
+            hits_json=json.dumps(ladder_to_hits(ladder)),
+            be_sent=0,
+            ts=now_ms()
+        )
+
+        self._touch_action()
+        return True, (
+            f"✅ PAPER BUY (signal)\n"
+            f"{symbol} | usd={usd:.2f}\n"
+            f"qty={qty:.8f} @ {entry:.6f}\n"
+            f"fee≈{buy.fee:.4f} USDT\n"
+            f"SL={sl:.2f}% | ladder={ladder}\n"
+            f"hint_entry(BOT1)={entry_hint:.6f}"
+        )
+
+    def manage_positions_tp_sl(self) -> List[str]:
+        notes = []
+        for p in self.db.list_positions():
+            try:
+                symbol = p["symbol"]
+                entry = float(p["entry"])
+                qty = float(p["qty"])
+                sl_pct = float(p["sl_pct"])
+                ladder = json.loads(p["ladder_json"]).get("ladder", self.ladder_default())
+                hits = json.loads(p["hits_json"]) if p["hits_json"] else ladder_to_hits(ladder)
+
+                px = get_last_price(symbol)
+                g = pct_gain(px, entry)
+
+                if g <= -abs(sl_pct):
+                    sell = paper_sell(symbol, qty)
+                    if sell.ok:
+                        self.db.delete_position(symbol)
+                        notes.append(f"🧯 SL | {symbol} gain={g:.2f}% → SELL 100% @ {sell.price:.6f}")
+                    else:
+                        notes.append(f"⚠️ SL | {symbol} error sell: {sell.err}")
                     continue
 
-                with state_lock:
-                    if symbol in STATE["active_symbols"]:
+                for lvl, w in parse_ladder(ladder):
+                    k = str(float(lvl))
+                    if hits.get(k, 0) == 1:
                         continue
-                    if STATE["slots"] > 0 and len(STATE["active_symbols"]) >= STATE["slots"]:
-                        continue
-                    STATE["exec_lock"] = True
-                    STATE["active_symbols"].add(symbol)
+                    if g >= lvl:
+                        sell_qty = qty * w
+                        sell_qty = math.floor(sell_qty * 1e8) / 1e8
+                        if sell_qty <= 0:
+                            hits[k] = 1
+                            continue
 
-                try:
-                    with state_lock:
-                        base = STATE["capital"] / max(1, STATE["slots"])
-                        if STATE["pnl_today"] >= SOFT_TARGET_PCT:
-                            base *= 0.5
-                        usdt_avail = max(0.0, STATE["capital"] - STATE["used_capital"])
-                        usdt = min(base, usdt_avail)
+                        sell = paper_sell(symbol, sell_qty)
+                        if sell.ok:
+                            qty_new = max(0.0, qty - sell_qty)
 
-                    if usdt < MIN_USDT_PER_TRADE:
-                        raise RuntimeError(f"Capital insuficiente (min {MIN_USDT_PER_TRADE} USDT)")
+                            hits[k] = 1
+                            if qty_new <= 1e-10:
+                                self.db.delete_position(symbol)
+                                notes.append(f"🎯 TP | {symbol} lvl={lvl:.2f}% → SELL final @ {sell.price:.6f}")
+                            else:
+                                fee_sell_total = float(p["fee_sell"]) + float(sell.fee)
+                                self.db.update_position_fields(symbol, {
+                                    "qty": float(qty_new),
+                                    "fee_sell": float(fee_sell_total),
+                                    "hits_json": json.dumps(hits),
+                                    "ts": now_ms()
+                                })
+                                notes.append(
+                                    f"🎯 TP | {symbol} lvl={lvl:.2f}% → SELL {w*100:.1f}% @ {sell.price:.6f} | qty_left={qty_new:.8f}"
+                                )
 
-                    execute_buy(app, symbol, usdt, float(sig["signal_price"] or 0), "BOT1")
+                            qty = qty_new
+                        else:
+                            notes.append(f"⚠️ TP | {symbol} error sell: {sell.err}")
 
-                    c2 = db()
-                    c2.execute(
-                        "UPDATE signals_active SET status='EXECUTED', exec_ts=? WHERE id=?",
-                        (int(time.time()), sig["id"])
-                    )
-                    c2.commit()
-                    c2.close()
+            except Exception as e:
+                notes.append(f"⚠️ manage err {p.get('symbol','?')}: {e}")
+        return notes
 
-                    with state_lock:
-                        STATE["used_capital"] += usdt
-                        STATE["trades_today"] += 1
-                    save_daily_state()
-                    did_trade = True
+    # =========================
+    # Señales desde sqlite (BOT1)
+    # =========================
+    def fetch_signals_from_sqlite(self) -> List[Dict[str, Any]]:
+        out = []
+        try:
+            import sqlite3
+            conn = sqlite3.connect(SIGNALS_SQLITE_FILE)
+            conn.row_factory = sqlite3.Row
 
-                except Exception as e:
-                    # guardar error real
-                    try:
-                        c2 = db()
-                        c2.execute(
-                            "UPDATE signals_active SET status='REJECTED', last_error=? WHERE id=?",
-                            (str(e), sig["id"])
-                        )
-                        c2.commit()
-                        c2.close()
-                    except Exception:
-                        pass
-                    send_from_thread(app, f"❌ AUTO rechazado {symbol}: {e}")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals_active(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              symbol TEXT,
+              side TEXT,
+              signal_price REAL,
+              status TEXT DEFAULT 'NEW',
+              ladder TEXT,
+              sl_pct REAL,
+              note TEXT,
+              ts INTEGER,
+              exec_ts INTEGER,
+              last_error TEXT
+            );
+            """)
+            conn.commit()
 
-                finally:
-                    with state_lock:
-                        STATE["exec_lock"] = False
-                        STATE["active_symbols"].discard(symbol)
+            rows = conn.execute(
+                "SELECT id, symbol, signal_price, ladder, sl_pct, ts FROM signals_active WHERE status='NEW' ORDER BY id ASC LIMIT 5"
+            ).fetchall()
 
-            if did_trade:
-                time.sleep(POLL_SLEEP_SEC)
-                continue
+            for r in rows:
+                out.append({
+                    "id": int(r["id"]),
+                    "symbol": str(r["symbol"]).upper(),
+                    "usd": self.per_trade_usd(),
+                    "entry": float(r["signal_price"] or 0),
+                    "ladder": str(r["ladder"] or self.ladder_default()),
+                    "sl": float(r["sl_pct"] or self.sl_default()),
+                    "ts": int(r["ts"] or now_ms()),
+                    "source": "sqlite",
+                })
+            conn.close()
+        except Exception:
+            pass
+        return out
 
-            # 2) Si no hubo señales, buscar auto-entries (agresivo)
-            #    (limitado a 1 trade por vuelta)
-            for symbol in coins[:]:
-                with state_lock:
-                    trades_today = STATE["trades_today"]
-                    if trades_today >= MAX_TRADES_PER_DAY:
-                        break
-                    if symbol in STATE["active_symbols"]:
-                        continue
-                    if STATE["slots"] > 0 and len(STATE["active_symbols"]) >= STATE["slots"]:
-                        continue
-                    STATE["active_symbols"].add(symbol)
+    def mark_signal_sqlite(self, signal_id: int, status: str, err: str = ""):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(SIGNALS_SQLITE_FILE)
+            if status == "EXECUTED":
+                conn.execute("UPDATE signals_active SET status='EXECUTED', exec_ts=? WHERE id=?", (now_ms(), signal_id))
+            else:
+                conn.execute("UPDATE signals_active SET status='REJECTED', last_error=? WHERE id=?", (err[:300], signal_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
-                try:
-                    a = compute_auto_entry(symbol)
-                    if not a:
-                        continue
+# =========================
+# Telegram handlers
+# =========================
+bot = Bot2Paper()
 
-                    with state_lock:
-                        base = STATE["capital"] / max(1, STATE["slots"])
-                        if STATE["pnl_today"] >= SOFT_TARGET_PCT:
-                            base *= 0.5
-                        usdt_avail = max(0.0, STATE["capital"] - STATE["used_capital"])
-                        usdt = min(base, usdt_avail)
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.reply_text(bot.status_text())
 
-                    if usdt < MIN_USDT_PER_TRADE:
-                        continue
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    global MODE
+    if not context.args:
+        await update.message.reply_text(f"Modo actual: {MODE}")
+        return
+    MODE = context.args[0].upper().strip()
+    bot.profile = get_profile(MODE)
+    bot.db.runtime_set("mode", MODE)
+    await update.message.reply_text(f"✅ Modo actualizado: {MODE}")
 
-                    execute_buy(app, symbol, usdt, 0.0, "AUTO")
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /buy SYMBOL USD  (paper)")
+        return
+    symbol = context.args[0].upper().strip()
+    usd = safe_float(context.args[1], bot.per_trade_usd())
+    sig = {"symbol": symbol, "usd": usd, "entry": 0, "ladder": bot.ladder_default(), "sl": bot.sl_default(), "ts": now_ms(), "source": "manual"}
+    ok, msg = bot.paper_open_from_signal(sig)
+    await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
 
-                    with state_lock:
-                        STATE["used_capital"] += usdt
-                        STATE["trades_today"] += 1
-                    save_daily_state()
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Uso: /sell SYMBOL [PCT]")
+        return
+    symbol = context.args[0].upper().strip()
+    pct = safe_float(context.args[1], 100.0) if len(context.args) >= 2 else 100.0
+    p = bot.db.get_position(symbol)
+    if not p:
+        await update.message.reply_text(f"⛔ No hay posición en {symbol}")
+        return
+    qty = float(p["qty"])
+    sell_qty = qty * max(0.01, min(1.0, pct/100.0))
+    sell_qty = math.floor(sell_qty * 1e8) / 1e8
+    sell = paper_sell(symbol, sell_qty)
+    if sell.ok:
+        qty_left = qty - sell_qty
+        if qty_left <= 1e-10:
+            bot.db.delete_position(symbol)
+        else:
+            bot.db.update_position_fields(symbol, {"qty": qty_left, "fee_sell": float(p["fee_sell"]) + float(sell.fee), "ts": now_ms()})
+        await update.message.reply_text(f"✅ PAPER SELL {symbol} qty={sell_qty:.8f} @ {sell.price:.6f} fee≈{sell.fee:.4f}")
+    else:
+        await update.message.reply_text(f"❌ SELL falló: {sell.err}")
 
-                    send_from_thread(app, f"🧠 AUTO-ENTRY OK: {symbol}\n{a.note}")
-                    break
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.reply_text(
+        "🧠 BOT2 PAPER comandos:\n"
+        "/status\n"
+        "/mode CONSERVADOR|NORMAL|AGRESIVO\n"
+        "/buy SYMBOL USD\n"
+        "/sell SYMBOL [PCT]\n\n"
+        "Amarre con BOT1 por Telegram:\n"
+        "En el chat de BOT2 manda:\n"
+        "SIG ADAUSDT 20 0.403 2:50,3.5:30,5:20 2.0"
+    )
 
-                except Exception as e:
-                    send_from_thread(app, f"❌ AUTO rechazado {symbol}: {e}")
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        text = update.message.text or ""
+        sig = parse_sig_message(text)
+        if not sig:
+            return
+        ok, msg = bot.paper_open_from_signal(sig)
+        await update.message.reply_text(msg if ok else ("❌ " + msg))
+    except Exception:
+        await update.message.reply_text("⚠️ error parsing SIG:\n" + traceback.format_exc())
 
-                finally:
-                    with state_lock:
-                        STATE["active_symbols"].discard(symbol)
+# =========================
+# Loop background
+# =========================
+async def safe_send(app: Application, text: str):
+    if not TELEGRAM_CHAT_ID_AUTO:
+        return
+    try:
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID_AUTO, text=text)
+    except Exception:
+        # red inestable = no te caes
+        pass
 
-            time.sleep(POLL_SLEEP_SEC)
+async def bg_loop(app: Application):
+    while True:
+        try:
+            if SIGNAL_SOURCE == "sqlite":
+                sigs = bot.fetch_signals_from_sqlite()
+                for s in sigs:
+                    ok, msg = bot.paper_open_from_signal(s)
+                    bot.mark_signal_sqlite(s["id"], "EXECUTED" if ok else "REJECTED", msg)
+                    await safe_send(app, msg if ok else ("❌ " + msg))
+
+            notes = bot.manage_positions_tp_sl()
+            if notes:
+                for n in notes[:6]:
+                    await safe_send(app, n)
 
         except Exception:
-            send_from_thread(app, "⚠️ Loop error:\n" + traceback.format_exc())
-            time.sleep(5)
+            await safe_send(app, "⚠️ bg_loop error:\n" + traceback.format_exc()[:3500])
 
-# =========================
-# MAIN
-# =========================
+        # ✅ FIX: NO existe app.bot.sleep()
+        await asyncio.sleep(LOOP_SEC)
+
 def main():
-    db_init()
-    load_daily_state()
+    if not TELEGRAM_TOKEN_AUTO:
+        raise SystemExit("Falta TELEGRAM_TOKEN_AUTO en env")
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Falta TELEGRAM_TOKEN_AUTO o TELEGRAM_CHAT_ID_AUTO")
-        return
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        print("❌ Falta BINANCE_API_KEY o BINANCE_API_SECRET")
-        return
-    if not BOT_PIN:
-        print("❌ Falta BOT_PIN")
-        return
+    app = Application.builder().token(TELEGRAM_TOKEN_AUTO).build()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("arm", cmd_arm))
-    app.add_handler(CommandHandler("stop_auto", cmd_stop_auto))
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("buy", cmd_buy))
+    app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    t = threading.Thread(target=process_loop, args=(app,), daemon=True)
-    t.start()
+    async def post_init(application: Application):
+        await safe_send(application, f"✅ BOT2 PAPER ONLINE | mode={MODE} | source={SIGNAL_SOURCE} | {now_utc()}")
+        # usa asyncio.create_task para no disparar el warning de PTB create_task
+        asyncio.get_running_loop().create_task(bg_loop(application))
 
-    print("✅ BOT2 AUTO iniciado.")
-    app.run_polling(close_loop=False)
+    app.post_init = post_init
+
+    # Polling más estable en Fly
+    app.run_polling(
+        close_loop=False,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=1.2,
+        timeout=25,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=20,
+    )
 
 if __name__ == "__main__":
     main()
